@@ -328,6 +328,8 @@ public interface VoltDBInterface
      * @return License API based on edition.
      */
     public LicenseApi getLicenseApi();
+    public void updateLicenseApi(LicenseApi newLicense);
+
     //Return JSON string represenation of license information.
     public String getLicenseInformation();
 
@@ -363,4 +365,5 @@ public interface VoltDBInterface
 
     boolean isMasterOnly();
     void setMasterOnly();
+
 }
