@@ -1804,16 +1804,16 @@ void PersistentTable::activateSnapshot(TableStreamType streamType) {
        std::ostringstream buffer;
        if (m_snapIt.get() != nullptr) {
           buffer << "Snapshot activated when previous one is not done on " << name() << std::endl;
-          LogManager::getThreadLogger(LOGGERID_HOST)->log(LOGLEVEL_WARN,buffer.str().c_str());
-          buffer.clear();
+          LogManager::getThreadLogger(LOGGERID_HOST)->log(LOGLEVEL_WARN, buffer.str().c_str());
        }
        stopSnapshot(TABLE_STREAM_SNAPSHOT, true);
        m_snapIt = allocator().template freeze<storage::truth>();
        m_snapshotStarted = true;
        vassert(m_invisibleTuplesPendingDeleteCount == 0);
 
-       buffer << "Snapshot activated on " << name() << std::endl;
-       LogManager::getThreadLogger(LOGGERID_HOST)->log(LOGLEVEL_INFO,buffer.str().c_str());
+       std::ostringstream buff;
+       buff << "Snapshot activated on " << name() << std::endl;
+       LogManager::getThreadLogger(LOGGERID_HOST)->log(LOGLEVEL_INFO, buff.str().c_str());
    } else if (streamType == TABLE_STREAM_ELASTIC_INDEX) {
        m_elasticIt = std::make_shared<ElasticIndexIterator>(allocator());
    }

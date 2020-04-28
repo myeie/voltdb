@@ -2561,6 +2561,9 @@ bool VoltDBEngine::activateTableStream(
     // can not be re-activated for cow mode.
     if (tableStreamTypeIsSnapshot(streamType)) {
         if (m_snapshottingTables.find(tableId) != m_snapshottingTables.end()) {
+            std::ostringstream buff;
+            buff << "Snapshot already activated on " << table->name() << std::endl;
+            LogManager::getThreadLogger(LOGGERID_HOST)->log(LOGLEVEL_WARN, buff.str().c_str());
             vassert(false);
             return false;
         }
