@@ -23,7 +23,7 @@
 using namespace voltdb;
 using namespace voltdb::storage;
 
-static char buf[256];
+static char  buf[256];
 
 inline ThreadLocalPoolAllocator::ThreadLocalPoolAllocator(size_t n) : m_blkSize(n),
     m_base(reinterpret_cast<char*>(allocateExactSizedObject(m_blkSize))) {
@@ -538,50 +538,23 @@ inline void CompactingStorageTrait::freeze() {
     }
 }
 
-template<typename Pred> inline void CompactingStorageTrait::thaw(Pred&& pred) {
+inline void CompactingStorageTrait::thaw() {
     if (m_frozen) {                        // release all chunks invisible to txn
         if (! m_storage.empty()) {
             auto& storage = reinterpret_cast<CompactingChunks&>(m_storage);
             auto const& beginTxn = storage.beginTxn();
             bool const empty = beginTxn.empty();
             auto const stop = empty ? 0 : beginTxn.iterator()->id();
-            if (! storage.frozenBoundaries() || // easy case: degenerated frozen boundary, or
-                    ! storage.finalizerAndCopier()) {                  // no finalizer involved
-                while (! m_storage.empty() && (empty || less_rolling(m_storage.front().id(), stop))) {
-                    assert(storage.begin()->range_begin() == storage.begin()->range_next());
-                    storage.pop_front();
-                }
-            } else {                       // harder case: has frozen boundary
-                auto const& left = storage.frozenBoundaries()->left(),
-                     &right = storage.frozenBoundaries()->right();
-                auto const& left_id = left.chunkId(), &right_id = right.chunkId();
-                while (! m_storage.empty() && (empty || less_rolling(m_storage.front().id(), stop))) {
-                    auto const& id = m_storage.front().id();
-                    storage.pop_finalize(id == left_id ? left.address() :
-                                (id == right_id ? right.address() : m_storage.front().range_end()),
-                            pred);
-                }
-                if (! m_storage.empty()) {                             // finalize on first txn chunk
-                    auto const& front = m_storage.front();
-                    auto const& beg_id = front.id();
-                    void const* dst = nullptr;
-                    if (beg_id == right_id) {
-                        dst = right.address();
-                    } else if (beg_id == left_id) {
-                        dst = left.address();
-                    } else if (less<id_type>()(left_id, beg_id) &&
-                            less<id_type>()(beg_id, right_id)) {
-                        dst = front.range_end();
-                    }
-                    if (dst != nullptr) {
-                        for (char const* ptr = reinterpret_cast<char const*>(front.range_next());
-                                ptr < dst; ptr += storage.tupleSize()) {
-                            if (pred(ptr)) {
-                                storage.finalizerAndCopier().finalize(ptr);
-                            }
-                        }
-                    }
-                }
+            // NOTE: we **never** finalize a TXN chunk (that is
+            // only visible to snapshot), since they had been
+            // either:
+            // 1. removed without compaction at which time it is
+            // finalized; or
+            // 2. moved due to compaction, whence the move does
+            // *not* deep copy (see `remove_force()')
+            while (! m_storage.empty() && (empty || less_rolling(m_storage.front().id(), stop))) {
+                assert(storage.begin()->range_begin() == storage.begin()->range_next());
+                storage.pop_front();
             }
         }
         m_frozen = false;
@@ -666,7 +639,7 @@ CompactingChunks::CompactingChunks(size_t tupleSize) noexcept :
 
 CompactingChunks::~CompactingChunks() {
     while (cbegin() != cend()) {
-        pop_finalize();
+        pop_finalize(nullptr);
     }
 }
 
@@ -748,20 +721,15 @@ inline typename CompactingChunks::list_type::iterator CompactingChunks::releasab
     return beginTxn().iterator(CompactingStorageTrait::releasable(beginTxn().iterator()));
 }
 
-inline void CompactingChunks::pop_finalize() {
+inline void CompactingChunks::pop_finalize(const void* to) {
     assert(begin() != end());
-    pop_finalize(begin()->range_next(), truth{});
-}
-
-template<typename Pred> inline void
-CompactingChunks::pop_finalize(const void* to, Pred&& pred) {
-    assert(begin() != end());
+    if (to == nullptr) {
+        to = begin()->range_next();
+    }
     if (m_finalizerAndCopier && begin()->range_begin() < to) {
         for (char const* ptr = reinterpret_cast<char const*>(begin()->range_begin());
                 ptr < to; ptr += tupleSize()) {
-            if (pred(ptr)) {
-                m_finalizerAndCopier.finalize(ptr);
-            }
+            m_finalizerAndCopier.finalize(ptr);
         }
     }
     pop_front();
@@ -804,9 +772,8 @@ inline void CompactingChunks::freeze() {
     }
 }
 
-template<typename Pred>
-inline void CompactingChunks::thaw(Pred&& pred) {
-    CompactingStorageTrait::thaw(pred);
+inline void CompactingChunks::thaw() {
+    CompactingStorageTrait::thaw();
     m_frozenTxnBoundaries = {};
 }
 
@@ -850,7 +817,7 @@ inline void CompactingChunks::clear(Remove_cb const& cb) {
             m_allocs = 0;
         } else {                               // fast clear path
             while (begin() != end()) {
-                pop_finalize();
+                pop_finalize(nullptr);
             }
             list_type::clear();
             m_allocs = 0;
@@ -860,22 +827,9 @@ inline void CompactingChunks::clear(Remove_cb const& cb) {
 }
 
 inline void* CompactingChunks::allocate() {
-    /**
-     * In 3 situations, we need to allocate in a new chunk:
-     * 1. TXN is empty
-     * 2. last chunk is full
-     * 3. Frozen, TXN has a single chunk, which happens to be
-     *  the right frozen boundary
-     */
     auto& txn = beginTxn();
-    bool newChunk = empty() || last()->full();
-    if (! newChunk) {
-        auto const& id = last()->id();
-        newChunk = txn.iterator()->id() == id &&
-            frozenBoundaries() && frozenBoundaries()->right().chunkId() == id;
-    }
     void* r;
-    if (newChunk) {
+    if (empty() || last()->full()) {
         // Under some circumstances (e.g. truncation when frozen, followed by
         // allocation (still frozen)), the inserted chunk is not
         // the only chunk.
@@ -937,12 +891,6 @@ ChunksIdNonValidator ChunksIdNonValidator::s_singleton{};
 
 inline ChunksIdNonValidator& ChunksIdNonValidator::instance() {
     return s_singleton;
-}
-
-inline void CompactingChunks::finalize(void const* p) const {
-    if (m_finalizerAndCopier) {
-        m_finalizerAndCopier.finalize(p);
-    }
 }
 
 inline void CompactingChunks::free(typename CompactingChunks::remove_direction dir, void const* p) {
@@ -1206,13 +1154,14 @@ inline void CompactingChunks::DelayedRemover::validate() const {
 }
 
 inline size_t CompactingChunks::DelayedRemover::finalize() const {
-    if (m_chunks.finalizerAndCopier() && ! (m_chunks.frozen() && m_chunks.frozenBoundaries())) {
-        // removed addresses need to be finalized right away
+    if (m_chunks.finalizerAndCopier()) {
+        // removed addresses (without compaction) need to be
+        // finalized right away, irrespective of whether we are frozen.
         for_each(m_removed.cbegin(), m_removed.cend(),
                 [this](void const* p) { m_chunks.finalizerAndCopier().finalize(p); });
         return m_removed.size();
-    } else {        // finalizer in frozen state must be postponed
-        return 0;
+    } else {
+        return 0lu;
     }
 }
 
@@ -1233,7 +1182,7 @@ inline void CompactingChunks::DelayedRemover::mapping() {
                       } else {
                           transform(h.cbegin(), h.cend(), next(m_moved.cbegin(), n),
                                   back_inserter(m_movements),
-                                  [](void* r, void* l) noexcept { return make_pair(l, r); });
+                                  [](void* r, void* l) noexcept { return make_pair(l, static_cast<void const*>(r)); });
                           return n + h.size();
                       }
                   } else {
@@ -1268,7 +1217,7 @@ inline void CompactingChunks::DelayedRemover::shift() {
     }
 }
 
-inline vector<pair<void*, void*>> const& CompactingChunks::DelayedRemover::movements() const {
+inline vector<pair<void*, void const*>> const& CompactingChunks::DelayedRemover::movements() const {
     validate();
     return m_movements;
 }
@@ -1837,6 +1786,9 @@ FinalizerAndCopier const TxnPreHook<Alloc, Trait, E>::EMPTY_FINALIZER{};
 
 template<typename Alloc, typename Trait, typename E>
 inline TxnPreHook<Alloc, Trait, E>::~TxnPreHook() {
+    if (m_recording) {         // should rarely happen
+        thaw();
+    }
     if (m_finalizerAndCopier) {
         for_each(m_changes.cbegin(), m_changes.cend(),
                 [this] (typename map_type::value_type const& entry) {
@@ -1870,14 +1822,15 @@ TxnPreHook<Alloc, Trait, E>::TxnPreHook(size_t tupleSize, FinalizerAndCopier con
 
 template<typename Alloc, typename Trait, typename E1>
 template<typename IteratorObserver, typename E2> inline void TxnPreHook<Alloc, Trait, E1>::add(
-        void const* dst, IteratorObserver& obs) {
+        add_cause cause, void const* dst, IteratorObserver& obs) {
     if (m_recording && ! obs(dst)) {
         auto const iter = m_changes.lower_bound(dst);
         if (iter == m_changes.cend() || iter->first != dst) {   // create a fresh copy
             void* fresh = m_changeStore.allocate();
-            m_changes.emplace_hint(iter, dst,
-                    m_finalizerAndCopier ? m_finalizerAndCopier.copy(fresh, dst) :
-                    memcpy(fresh, dst, m_changeStore.tupleSize()));
+            // TODO: invoke deep copier only on updates.
+            m_changes.emplace_hint(iter, dst, m_finalizerAndCopier ?
+                    m_finalizerAndCopier.copy(fresh, dst) :            // deep copy, or
+                    memcpy(fresh, dst, m_changeStore.tupleSize()));    // shallow copy
         }
     }
 }
@@ -1896,7 +1849,6 @@ template<typename Alloc, typename Trait, typename E> inline void TxnPreHook<Allo
             for_each(m_changes.begin(), m_changes.end(),
                     [this](typename map_type::value_type& p) { m_finalizerAndCopier.finalize(p.second); });
         }
-        m_removed.clear();
         m_changes.clear();
         m_changeStore.clear();
         m_recording = false;
@@ -1909,23 +1861,6 @@ template<typename Alloc, typename Trait, typename E>
 inline void const* TxnPreHook<Alloc, Trait, E>::operator()(void const* src) const {
     auto const& pos = m_changes.find(src);
     return pos == m_changes.cend() ? src : pos->second;
-}
-
-template<typename Alloc, typename Trait, typename E> inline bool
-TxnPreHook<Alloc, Trait, E>::removed_add(CompactingChunks const& c, void const* src) {
-    return m_removed.emplace(c, src).second;
-}
-
-template<typename Alloc, typename Trait, typename E> inline bool
-TxnPreHook<Alloc, Trait, E>::removed_contains(void const* p) const noexcept {
-    return m_removed.count({p});
-}
-
-template<typename Alloc, typename Trait, typename E> inline position_type const&
-TxnPreHook<Alloc, Trait, E>::removed_find(void const* p) const {
-    auto const& iter = m_removed.find({p});
-    assert(iter != m_removed.cend());
-    return *iter;
 }
 
 template<typename Alloc, typename Trait, typename E>
@@ -1950,7 +1885,8 @@ template<typename Hook, typename E> inline void* HookedCompactingChunks<Hook, E>
 template<typename Hook, typename E>
 template<typename Tag> inline void HookedCompactingChunks<Hook, E>::clear() {
     CompactingChunks::clear([this] (void const* s) noexcept {
-                Hook::add(s, reinterpret_cast<observer_type<Tag>&>(m_iterator_observer));
+                Hook::add(Hook::add_cause::remove,
+                        s, reinterpret_cast<observer_type<Tag>&>(m_iterator_observer));
             });
 }
 
@@ -1968,7 +1904,8 @@ HookedCompactingChunks<Hook, E>::remove(typename CompactingChunks::remove_direct
 template<typename Hook, typename E>
 template<typename Tag> inline void HookedCompactingChunks<Hook, E>::update(void* dst) {
     VOLT_TRACE("update(%p)", dst);
-    Hook::add(dst, reinterpret_cast<observer_type<Tag>&>(m_iterator_observer));
+    Hook::add(Hook::add_cause::update, dst,
+            reinterpret_cast<observer_type<Tag>&>(m_iterator_observer));
 }
 
 template<typename Hook, typename E>
@@ -1985,11 +1922,9 @@ HookedCompactingChunks<Hook, E>::freeze() {
     return ptr;
 }
 
-template<typename Hook, typename E>
-template<typename Tag> inline void HookedCompactingChunks<Hook, E>::thaw() {
-    CompactingChunks::thaw([this](void const* p) noexcept {
-            return this->removed_contains(p);
-        });
+template<typename Hook, typename E> template<typename Tag> inline void
+HookedCompactingChunks<Hook, E>::thaw() {
+    CompactingChunks::thaw();
     Hook::thaw();
     reinterpret_cast<observer_type<Tag>&>(m_iterator_observer).reset();
 }
@@ -2012,40 +1947,34 @@ HookedCompactingChunks<Hook, E>::remove_reset() {
 template<typename Hook, typename E>
 template<typename Tag> inline pair<size_t, size_t>
 HookedCompactingChunks<Hook, E>::remove_force(
-        function<void(vector<pair<void*, void*>> const&)> const& cb) {
-    // finalize before memcpy
-    auto const finalized = CompactingChunks::m_batched.finalize();
-    if (frozen()) {            // hook registration on movements only
+        function<void(vector<pair<void*, void const*>> const&)> const& cb) {
+    if (frozen()) {
+        // hook registration on movements and deletes
         for_each(CompactingChunks::m_batched.movements().cbegin(),
                 CompactingChunks::m_batched.movements().cend(),
-                [this](pair<void*, void*> const& entry) {
-                    Hook::add(entry.first,
+                [this](pair<void*, void const*> const& entry) {
+                    // we need to register both addresses:
+                    // we need to register tuples to be deleted for sure;
+                    Hook::add(Hook::add_cause::remove, entry.first,
+                            reinterpret_cast<observer_type<Tag>&>(m_iterator_observer));
+                    // we also need to register tuple that
+                    // compacts to deleted tuple, see
+                    // testHookedCompactingChunksBatchRemove_single2a.
+                    // In most cases, this tuple had already been captured
+                    // in hook memory; but in rare cases, it may not be.
+                    Hook::add(Hook::add_cause::remove, entry.second,
                             reinterpret_cast<observer_type<Tag>&>(m_iterator_observer));
                 });
         for_each(CompactingChunks::m_batched.removed().cbegin(),
                 CompactingChunks::m_batched.removed().cend(),
-                [this] (void const* pos) {
-                    if (! this->removed_add(*this, pos)) {         // report conflict
-                        auto const cur = position_type{*this, pos};
-                        auto const& existing = this->removed_find(pos);
-                        auto const& cur_chunk = this->find(cur.chunkId(), false),
-                            &existing_chunk = this->find(existing.chunkId(), false);
-                        assert(cur_chunk.first);
-                        assert(existing_chunk.first);
-                        snprintf(buf, sizeof buf,
-                                "Failed to add to Hook::m_removed: %lu: %p [%p - %p / %p] <=> %lu: %p [%p - %p / %p]\n",
-                                cur.chunkId(), cur.address(),
-                                cur_chunk.second->range_begin(), cur_chunk.second->range_next(),
-                                cur_chunk.second->range_end(),
-                                existing.chunkId(), existing.address(),
-                                existing_chunk.second->range_begin(), existing_chunk.second->range_next(),
-                                existing_chunk.second->range_end());
-                        buf[sizeof buf - 1] = 0;
-                        throw runtime_error(buf);
-                    }
+                [this](void const* p) {
+                    Hook::add(Hook::add_cause::remove, p,
+                            reinterpret_cast<observer_type<Tag>&>(m_iterator_observer));
                 });
     }
-    cb(CompactingChunks::m_batched.movements());    // memcpy by call back
+    // finalize before memcpy, but after adding to hook memory
+    auto const finalized = CompactingChunks::m_batched.finalize();
+    cb(CompactingChunks::m_batched.movements());      // finalize dst, shallow copy and with index update
     return make_pair(CompactingChunks::m_batched.force(), finalized);
 }
 
@@ -2215,7 +2144,7 @@ HookedIteratorCodegen(NthBitChecker<6>); HookedIteratorCodegen(NthBitChecker<7>)
 #define HookedMethods4(tag, alloc, gc, alloc2)                                           \
 template void TxnPreHook<alloc, HistoryRetainTrait<gc>>::add<typename                    \
         IterableTableTupleChunks<alloc2, tag, void>::IteratorObserver, void>(            \
-            void const*,                                                                 \
+            TxnPreHook<alloc, HistoryRetainTrait<gc>>::add_cause, void const*,           \
             typename IterableTableTupleChunks<alloc2, tag, void>::IteratorObserver&)
 #define HookedMethods3(tag, alloc, gc)                                                   \
     HookedMethods4(tag, alloc, gc, __codegen__::t1);                                     \
@@ -2234,7 +2163,7 @@ template void HookedCompactingChunks<TxnPreHook<alloc, HistoryRetainTrait<gc>>, 
 template void HookedCompactingChunks<TxnPreHook<alloc, HistoryRetainTrait<gc>>, void>::clear<tag>();             \
 template pair<size_t, size_t> HookedCompactingChunks<TxnPreHook<alloc,                   \
         HistoryRetainTrait<gc>>, void>::remove_force<tag>(                               \
-        function<void(vector<pair<void*, void*>> const&)> const&);                       \
+        function<void(vector<pair<void*, void const*>> const&)> const&);                 \
 HookedMethods3(tag, alloc, gc)
 
 #define HookedMethods1(tag, alloc)                                                       \
