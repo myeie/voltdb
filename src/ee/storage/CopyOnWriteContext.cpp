@@ -153,7 +153,7 @@ int64_t CopyOnWriteContext::handleStreamMore(TupleOutputStreamProcessor &outputS
 
     std::ostringstream buf;
     buf << "Stream snapshot on " << table.name() << " remaining tuples:" << m_tuplesRemaining << " batch:" << m_serializationBatches << std::endl;
-    LogManager::getThreadLogger(LOGGERID_HOST)->log(LOGLEVEL_ERROR, buf.str().c_str());
+    LogManager::getThreadLogger(LOGGERID_HOST)->log(LOGLEVEL_INFO, buf.str().c_str());
 
     // Need to close the output streams and insert row counts.
     outputStreams.close();
